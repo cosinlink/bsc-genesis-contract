@@ -365,6 +365,353 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
     }
   }
 
+  function distributeFinalityReward(address[] calldata valAddrs, uint256[] calldata weights) external onlyCoinbase oncePerBlock onlyZeroGasPrice onlyInit {
+    uint256 totalValue;
+    uint256 balanceOfSystemReward = address(SYSTEM_REWARD_ADDR).balance;
+    if (balanceOfSystemReward > MAX_SYSTEM_REWARD_BALANCE) {
+      // when a slash happens, theres will no rewards in some epochs,
+      // it's tolerated because slash happens rarely
+      totalValue = balanceOfSystemReward.sub(MAX_SYSTEM_REWARD_BALANCE);
+    } else {
+      return;
+    }
+
+    totalValue = ISystemReward(SYSTEM_REWARD_ADDR).claimRewards(payable(address(this)), totalValue);
+    if (totalValue == 0) {
+      return;
+    }
+
+    uint256 totalWeight;
+    for (uint256 i; i<weights.length; ++i) {
+      totalWeight += weights[i];
+    }
+    if (totalWeight == 0) {
+      return;
+    }
+
+    uint256 value;
+    address valAddr;
+    uint256 index;
+
+    for (uint256 i; i<valAddrs.length; ++i) {
+      value = (totalValue * weights[i]) / totalWeight;
+      valAddr = valAddrs[i];
+      index = currentValidatorSetMap[valAddr];
+      if (index > 0) {
+        Validator storage validator = currentValidatorSet[index - 1];
+        if (validator.jailed) {
+          emit deprecatedFinalityRewardDeposit(valAddr, value);
+        } else {
+          totalInComing = totalInComing.add(value);
+          validator.incoming = validator.incoming.add(value);
+          emit finalityRewardDeposit(valAddr, value);
+        }
+      } else {
+        // get incoming from deprecated validator;
+        emit deprecatedFinalityRewardDeposit(valAddr, value);
+      }
+    }
+
+  }
+
+  /*********************** View Functions **************************/
+  /**
+   * @notice Return the vote address and consensus address of the validators in `currentValidatorSet` that are not jailed
+   */
+  function getLivingValidators() external view override returns (address[] memory, bytes[] memory) {
+    uint n = currentValidatorSet.length;
+    uint living;
+    for (uint i; i<n; ++i) {
+      if (!currentValidatorSet[i].jailed) {
+        living ++;
+      }
+    }
+    address[] memory consensusAddrs = new address[](living);
+    bytes[] memory voteAddrs = new bytes[](living);
+    living = 0;
+    if (validatorExtraSet.length == n) {
+      for (uint i; i<n; ++i) {
+        if (!currentValidatorSet[i].jailed) {
+          consensusAddrs[living] = currentValidatorSet[i].consensusAddress;
+          voteAddrs[living] = validatorExtraSet[i].voteAddress;
+          living ++;
+        }
+      }
+    } else {
+      for (uint i; i<n; ++i) {
+        if (!currentValidatorSet[i].jailed) {
+          consensusAddrs[living] = currentValidatorSet[i].consensusAddress;
+          living ++;
+        }
+      }
+    }
+    return (consensusAddrs, voteAddrs);
+  }
+
+  /**
+   * @notice Return the vote address and consensus address of mining validators
+   *
+   * Mining validators are block producers in the current epoch
+   * including most of the cabinets and a few of the candidates
+   */
+  function getMiningValidators() external view override returns(address[] memory, bytes[] memory) {
+    uint256 _maxNumOfWorkingCandidates = maxNumOfWorkingCandidates;
+    uint256 _numOfCabinets = numOfCabinets > 0 ? numOfCabinets : INIT_NUM_OF_CABINETS;
+
+    address[] memory validators = getValidators();
+    bytes[] memory voteAddrs = getVoteAddresses(validators);
+    if (validators.length <= _numOfCabinets) {
+      return (validators, voteAddrs);
+    }
+
+    if ((validators.length - _numOfCabinets) < _maxNumOfWorkingCandidates){
+      _maxNumOfWorkingCandidates = validators.length - _numOfCabinets;
+    }
+    if (_maxNumOfWorkingCandidates > 0) {
+      uint256 epochNumber = block.number / EPOCH;
+      shuffle(validators, voteAddrs, epochNumber, _numOfCabinets-_maxNumOfWorkingCandidates, 0, _maxNumOfWorkingCandidates, _numOfCabinets);
+      shuffle(validators, voteAddrs, epochNumber, _numOfCabinets-_maxNumOfWorkingCandidates, _numOfCabinets-_maxNumOfWorkingCandidates,
+        _maxNumOfWorkingCandidates, validators.length - _numOfCabinets+_maxNumOfWorkingCandidates);
+    }
+    address[] memory miningValidators = new address[](_numOfCabinets);
+    bytes[] memory miningVoteAddrs = new bytes[](_numOfCabinets);
+    for (uint i; i<_numOfCabinets; ++i) {
+      miningValidators[i] = validators[i];
+      miningVoteAddrs[i] = voteAddrs[i];
+    }
+    return (miningValidators, miningVoteAddrs);
+  }
+
+  /**
+   * @notice Return the consensus address of the validators in `currentValidatorSet` that are not jailed and not maintaining
+   */
+  function getValidators() public view returns(address[] memory) {
+    uint n = currentValidatorSet.length;
+    uint valid = 0;
+    for (uint i; i<n; ++i) {
+      if (isWorkingValidator(i)) {
+        ++valid;
+      }
+    }
+    address[] memory consensusAddrs = new address[](valid);
+    valid = 0;
+    for (uint i; i<n; ++i) {
+      if (isWorkingValidator(i)) {
+        consensusAddrs[valid] = currentValidatorSet[i].consensusAddress;
+        ++valid;
+      }
+    }
+    return consensusAddrs;
+  }
+
+  /**
+   * @notice Return the current incoming of the validator
+   */
+  function getIncoming(address validator)external view returns(uint256) {
+    uint256 index = currentValidatorSetMap[validator];
+    if (index<=0) {
+      return 0;
+    }
+    return currentValidatorSet[index-1].incoming;
+  }
+
+  /**
+   * @notice Return whether the validator is a working validator(not jailed or maintaining) by index
+   *
+   * @param index The index of the validator in `currentValidatorSet`(from 0 to `currentValidatorSet.length-1`)
+   */
+  function isWorkingValidator(uint index) public view returns (bool) {
+    if (index >= currentValidatorSet.length) {
+      return false;
+    }
+
+    // validatorExtraSet[index] should not be used before it has been init.
+    if (index >= validatorExtraSet.length) {
+      return !currentValidatorSet[index].jailed;
+    }
+
+    return !currentValidatorSet[index].jailed && !validatorExtraSet[index].isMaintaining;
+  }
+
+  /**
+   * @notice Return whether the validator is a working validator(not jailed or maintaining) by consensus address
+   * Will return false if the validator is not in `currentValidatorSet`
+   */
+  function isCurrentValidator(address validator) external view override returns (bool) {
+    uint256 index = currentValidatorSetMap[validator];
+    if (index <= 0) {
+      return false;
+    }
+
+    // the actual index
+    index = index - 1;
+    return isWorkingValidator(index);
+  }
+
+  /**
+   * @notice Return the index of the validator in `currentValidatorSet`(from 0 to `currentValidatorSet.length-1`)
+   */
+  function getCurrentValidatorIndex(address validator) public view returns (uint256) {
+    uint256 index = currentValidatorSetMap[validator];
+    require(index > 0, "only current validators");
+
+    // the actual index
+    return index - 1;
+  }
+
+  function getMiningValidatorCount() public view returns(uint256 miningValidatorCount) {
+    miningValidatorCount = getValidators().length;
+    uint256 _numOfCabinets = numOfCabinets > 0 ? numOfCabinets : INIT_NUM_OF_CABINETS;
+    if (miningValidatorCount > _numOfCabinets) {
+      miningValidatorCount = _numOfCabinets;
+    }
+    if (miningValidatorCount == 0) {
+      miningValidatorCount = 1;
+    }
+  }
+
+  /*********************** For slash **************************/
+  function misdemeanor(address validator) external onlySlash initValidatorExtraSet override {
+    uint256 validatorIndex = _misdemeanor(validator);
+    if (canEnterMaintenance(validatorIndex)) {
+      _enterMaintenance(validator, validatorIndex);
+    }
+  }
+
+  function felony(address validator) external initValidatorExtraSet override {
+    require(msg.sender == SLASH_CONTRACT_ADDR || msg.sender == STAKE_HUB_ADDR, "only slash or stakeHub contract");
+
+    uint256 index = currentValidatorSetMap[validator];
+    if (index <= 0) {
+      return;
+    }
+    // the actual index
+    index = index - 1;
+
+    bool isMaintaining = validatorExtraSet[index].isMaintaining;
+    if (_felony(validator, index) && isMaintaining) {
+      --numOfMaintaining;
+    }
+  }
+
+  function removeTmpMigratedValidator(address validator) external onlyStakeHub {
+    for (uint256 i; i < _tmpMigratedValidatorSet.length; ++i) {
+      if (_tmpMigratedValidatorSet[i].consensusAddress == validator) {
+        _tmpMigratedValidatorSet[i].jailed = true;
+        break;
+      }
+    }
+  }
+
+  /*********************** For Temporary Maintenance **************************/
+  /**
+   * @notice Return whether the validator at index could enter maintenance
+   */
+  function canEnterMaintenance(uint256 index) public view returns (bool) {
+    if (index >= currentValidatorSet.length) {
+      return false;
+    }
+
+    if (
+      currentValidatorSet[index].consensusAddress == address(0)     // - 0. check if empty validator
+      || (maxNumOfMaintaining == 0 || maintainSlashScale == 0)      // - 1. check if not start
+      || numOfMaintaining >= maxNumOfMaintaining                    // - 2. check if reached upper limit
+      || !isWorkingValidator(index)                                 // - 3. check if not working(not jailed and not maintaining)
+      || validatorExtraSet[index].enterMaintenanceHeight > 0        // - 5. check if has Maintained during current 24-hour period
+                                                                    // current validators are selected every 24 hours(from 00:00:00 UTC to 23:59:59 UTC)
+      || getValidators().length <= 1                                // - 6. check num of remaining working validators
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * @dev Enter maintenance for current validators. refer to https://github.com/bnb-chain/BEPs/blob/master/BEP127.md
+   */
+  function enterMaintenance() external initValidatorExtraSet {
+    // check maintain config
+    if (maxNumOfMaintaining == 0) {
+      maxNumOfMaintaining = INIT_MAX_NUM_OF_MAINTAINING;
+    }
+    if (maintainSlashScale == 0) {
+      maintainSlashScale = INIT_MAINTAIN_SLASH_SCALE;
+    }
+
+    uint256 index = getCurrentValidatorIndex(msg.sender);
+    require(canEnterMaintenance(index), "can not enter Temporary Maintenance");
+    _enterMaintenance(msg.sender, index);
+  }
+
+  /**
+   * @dev Exit maintenance for current validators. refer to https://github.com/bnb-chain/BEPs/blob/master/BEP127.md
+   */
+  function exitMaintenance() external {
+    uint256 index = getCurrentValidatorIndex(msg.sender);
+
+    // jailed validators are allowed to exit maintenance
+    require(validatorExtraSet[index].isMaintaining, "not in maintenance");
+    uint256 workingValidatorCount = getWorkingValidatorCount();
+    _exitMaintenance(msg.sender, index, workingValidatorCount);
+  }
+
+  /*********************** Param update ********************************/
+  function updateParam(string calldata key, bytes calldata value) override external onlyInit onlyGov{
+    if (Memory.compareStrings(key, "expireTimeSecondGap")) {
+      require(value.length == 32, "length of expireTimeSecondGap mismatch");
+      uint256 newExpireTimeSecondGap = BytesToTypes.bytesToUint256(32, value);
+      require(newExpireTimeSecondGap >=100 && newExpireTimeSecondGap <= 1e5, "the expireTimeSecondGap is out of range");
+      expireTimeSecondGap = newExpireTimeSecondGap;
+    } else if (Memory.compareStrings(key, "burnRatio")) {
+      require(value.length == 32, "length of burnRatio mismatch");
+      uint256 newBurnRatio = BytesToTypes.bytesToUint256(32, value);
+      require(newBurnRatio.add(systemRewardRatio) <= BLOCK_FEES_RATIO_SCALE, "the burnRatio plus systemRewardRatio must be no greater than 10000");
+      burnRatio = newBurnRatio;
+    } else if (Memory.compareStrings(key, "maxNumOfMaintaining")) {
+      require(value.length == 32, "length of maxNumOfMaintaining mismatch");
+      uint256 newMaxNumOfMaintaining = BytesToTypes.bytesToUint256(32, value);
+      uint256 _numOfCabinets = numOfCabinets;
+      if (_numOfCabinets == 0) {
+        _numOfCabinets = INIT_NUM_OF_CABINETS;
+      }
+      require(newMaxNumOfMaintaining < _numOfCabinets, "the maxNumOfMaintaining must be less than numOfCabinets");
+      maxNumOfMaintaining = newMaxNumOfMaintaining;
+    } else if (Memory.compareStrings(key, "maintainSlashScale")) {
+      require(value.length == 32, "length of maintainSlashScale mismatch");
+      uint256 newMaintainSlashScale = BytesToTypes.bytesToUint256(32, value);
+      require(newMaintainSlashScale > 0 && newMaintainSlashScale < 10, "the maintainSlashScale must be greater than 0 and less than 10");
+      maintainSlashScale = newMaintainSlashScale;
+    } else if (Memory.compareStrings(key, "maxNumOfWorkingCandidates")) {
+      require(value.length == 32, "length of maxNumOfWorkingCandidates mismatch");
+      uint256 newMaxNumOfWorkingCandidates = BytesToTypes.bytesToUint256(32, value);
+      require(newMaxNumOfWorkingCandidates <= maxNumOfCandidates, "the maxNumOfWorkingCandidates must be not greater than maxNumOfCandidates");
+      maxNumOfWorkingCandidates = newMaxNumOfWorkingCandidates;
+    } else if (Memory.compareStrings(key, "maxNumOfCandidates")) {
+      require(value.length == 32, "length of maxNumOfCandidates mismatch");
+      uint256 newMaxNumOfCandidates = BytesToTypes.bytesToUint256(32, value);
+      maxNumOfCandidates = newMaxNumOfCandidates;
+      if (maxNumOfWorkingCandidates > maxNumOfCandidates) {
+        maxNumOfWorkingCandidates = maxNumOfCandidates;
+      }
+    } else if (Memory.compareStrings(key, "numOfCabinets")) {
+      require(value.length == 32, "length of numOfCabinets mismatch");
+      uint256 newNumOfCabinets = BytesToTypes.bytesToUint256(32, value);
+      require(newNumOfCabinets > 0, "the numOfCabinets must be greater than 0");
+      require(newNumOfCabinets <= MAX_NUM_OF_VALIDATORS, "the numOfCabinets must be less than MAX_NUM_OF_VALIDATORS");
+      numOfCabinets = newNumOfCabinets;
+    } else if (Memory.compareStrings(key, "systemRewardRatio")) {
+      require(value.length == 32, "length of systemRewardRatio mismatch");
+      uint256 newSystemRewardRatio = BytesToTypes.bytesToUint256(32, value);
+      require(newSystemRewardRatio.add(burnRatio) <= BLOCK_FEES_RATIO_SCALE, "the systemRewardRatio plus burnRatio must be no greater than 10000");
+      systemRewardRatio = newSystemRewardRatio;
+    } else {
+      require(false, "unknown param");
+    }
+    emit paramChange(key, value);
+  }
+
+  /*********************** Internal Functions **************************/
   function updateValidatorSet(Validator[] memory validatorSet, bytes[] memory voteAddrs) internal returns (uint32) {
     {
       // do verify.
@@ -531,369 +878,6 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
     return CODE_OK;
   }
 
-  /**
-   * @dev With each epoch, there will be a partial rotation between cabinets and candidates. Rotation is determined by this function
-   */
-  function shuffle(address[] memory validators, bytes[] memory voteAddrs, uint256 epochNumber, uint startIdx, uint offset, uint limit, uint modNumber) internal pure {
-    for (uint i; i<limit; ++i) {
-      uint random = uint(keccak256(abi.encodePacked(epochNumber, startIdx+i))) % modNumber;
-      if ( (startIdx+i) != (offset+random) ) {
-        address tmpAddr = validators[startIdx+i];
-        bytes memory tmpBLS = voteAddrs[startIdx+i];
-        validators[startIdx+i] = validators[offset+random];
-        validators[offset+random] = tmpAddr;
-        voteAddrs[startIdx+i] = voteAddrs[offset+random];
-        voteAddrs[offset+random] = tmpBLS;
-      }
-    }
-  }
-
-  /**
-   * @notice Return the vote address and consensus address of the validators in `currentValidatorSet` that are not jailed
-   */
-  function getLivingValidators() external view override returns (address[] memory, bytes[] memory) {
-    uint n = currentValidatorSet.length;
-    uint living;
-    for (uint i; i<n; ++i) {
-      if (!currentValidatorSet[i].jailed) {
-        living ++;
-      }
-    }
-    address[] memory consensusAddrs = new address[](living);
-    bytes[] memory voteAddrs = new bytes[](living);
-    living = 0;
-    if (validatorExtraSet.length == n) {
-      for (uint i; i<n; ++i) {
-        if (!currentValidatorSet[i].jailed) {
-          consensusAddrs[living] = currentValidatorSet[i].consensusAddress;
-          voteAddrs[living] = validatorExtraSet[i].voteAddress;
-          living ++;
-        }
-      }
-    } else {
-      for (uint i; i<n; ++i) {
-        if (!currentValidatorSet[i].jailed) {
-          consensusAddrs[living] = currentValidatorSet[i].consensusAddress;
-          living ++;
-        }
-      }
-    }
-    return (consensusAddrs, voteAddrs);
-  }
-
-  /**
-   * @notice Return the vote address and consensus address of mining validators
-   *
-   * Mining validators are block producers in the current epoch
-   * including most of the cabinets and a few of the candidates
-   */
-  function getMiningValidators() external view override returns(address[] memory, bytes[] memory) {
-    uint256 _maxNumOfWorkingCandidates = maxNumOfWorkingCandidates;
-    uint256 _numOfCabinets = numOfCabinets > 0 ? numOfCabinets : INIT_NUM_OF_CABINETS;
-
-    address[] memory validators = getValidators();
-    bytes[] memory voteAddrs = getVoteAddresses(validators);
-    if (validators.length <= _numOfCabinets) {
-      return (validators, voteAddrs);
-    }
-
-    if ((validators.length - _numOfCabinets) < _maxNumOfWorkingCandidates){
-      _maxNumOfWorkingCandidates = validators.length - _numOfCabinets;
-    }
-    if (_maxNumOfWorkingCandidates > 0) {
-      uint256 epochNumber = block.number / EPOCH;
-      shuffle(validators, voteAddrs, epochNumber, _numOfCabinets-_maxNumOfWorkingCandidates, 0, _maxNumOfWorkingCandidates, _numOfCabinets);
-      shuffle(validators, voteAddrs, epochNumber, _numOfCabinets-_maxNumOfWorkingCandidates, _numOfCabinets-_maxNumOfWorkingCandidates,
-        _maxNumOfWorkingCandidates, validators.length - _numOfCabinets+_maxNumOfWorkingCandidates);
-    }
-    address[] memory miningValidators = new address[](_numOfCabinets);
-    bytes[] memory miningVoteAddrs = new bytes[](_numOfCabinets);
-    for (uint i; i<_numOfCabinets; ++i) {
-      miningValidators[i] = validators[i];
-      miningVoteAddrs[i] = voteAddrs[i];
-    }
-    return (miningValidators, miningVoteAddrs);
-  }
-
-  /**
-   * @notice Return the consensus address of the validators in `currentValidatorSet` that are not jailed and not maintaining
-   */
-  function getValidators() public view returns(address[] memory) {
-    uint n = currentValidatorSet.length;
-    uint valid = 0;
-    for (uint i; i<n; ++i) {
-      if (isWorkingValidator(i)) {
-        ++valid;
-      }
-    }
-    address[] memory consensusAddrs = new address[](valid);
-    valid = 0;
-    for (uint i; i<n; ++i) {
-      if (isWorkingValidator(i)) {
-        consensusAddrs[valid] = currentValidatorSet[i].consensusAddress;
-        ++valid;
-      }
-    }
-    return consensusAddrs;
-  }
-
-  /**
-   * @notice Return whether the validator is a working validator(not jailed or maintaining) by index
-   *
-   * @param index The index of the validator in `currentValidatorSet`(from 0 to `currentValidatorSet.length-1`)
-   */
-  function isWorkingValidator(uint index) public view returns (bool) {
-    if (index >= currentValidatorSet.length) {
-      return false;
-    }
-
-    // validatorExtraSet[index] should not be used before it has been init.
-    if (index >= validatorExtraSet.length) {
-      return !currentValidatorSet[index].jailed;
-    }
-
-    return !currentValidatorSet[index].jailed && !validatorExtraSet[index].isMaintaining;
-  }
-
-  /**
-   * @notice Return the current incoming of the validator
-   */
-  function getIncoming(address validator)external view returns(uint256) {
-    uint256 index = currentValidatorSetMap[validator];
-    if (index<=0) {
-      return 0;
-    }
-    return currentValidatorSet[index-1].incoming;
-  }
-
-  /**
-   * @notice Return whether the validator is a working validator(not jailed or maintaining) by consensus address
-   * Will return false if the validator is not in `currentValidatorSet`
-   */
-  function isCurrentValidator(address validator) external view override returns (bool) {
-    uint256 index = currentValidatorSetMap[validator];
-    if (index <= 0) {
-      return false;
-    }
-
-    // the actual index
-    index = index - 1;
-    return isWorkingValidator(index);
-  }
-
-  function distributeFinalityReward(address[] calldata valAddrs, uint256[] calldata weights) external onlyCoinbase oncePerBlock onlyZeroGasPrice onlyInit {
-    uint256 totalValue;
-    uint256 balanceOfSystemReward = address(SYSTEM_REWARD_ADDR).balance;
-    if (balanceOfSystemReward > MAX_SYSTEM_REWARD_BALANCE) {
-      // when a slash happens, theres will no rewards in some epochs,
-      // it's tolerated because slash happens rarely
-      totalValue = balanceOfSystemReward.sub(MAX_SYSTEM_REWARD_BALANCE);
-    } else {
-      return;
-    }
-
-    totalValue = ISystemReward(SYSTEM_REWARD_ADDR).claimRewards(payable(address(this)), totalValue);
-    if (totalValue == 0) {
-      return;
-    }
-
-    uint256 totalWeight;
-    for (uint256 i; i<weights.length; ++i) {
-      totalWeight += weights[i];
-    }
-    if (totalWeight == 0) {
-      return;
-    }
-
-    uint256 value;
-    address valAddr;
-    uint256 index;
-
-    for (uint256 i; i<valAddrs.length; ++i) {
-      value = (totalValue * weights[i]) / totalWeight;
-      valAddr = valAddrs[i];
-      index = currentValidatorSetMap[valAddr];
-      if (index > 0) {
-        Validator storage validator = currentValidatorSet[index - 1];
-        if (validator.jailed) {
-          emit deprecatedFinalityRewardDeposit(valAddr, value);
-        } else {
-          totalInComing = totalInComing.add(value);
-          validator.incoming = validator.incoming.add(value);
-          emit finalityRewardDeposit(valAddr, value);
-        }
-      } else {
-        // get incoming from deprecated validator;
-        emit deprecatedFinalityRewardDeposit(valAddr, value);
-      }
-    }
-
-  }
-
-  function getWorkingValidatorCount() public view returns(uint256 workingValidatorCount) {
-    workingValidatorCount = getValidators().length;
-    uint256 _numOfCabinets = numOfCabinets > 0 ? numOfCabinets : INIT_NUM_OF_CABINETS;
-    if (workingValidatorCount > _numOfCabinets) {
-      workingValidatorCount = _numOfCabinets;
-    }
-    if (workingValidatorCount == 0) {
-      workingValidatorCount = 1;
-    }
-  }
-
-  /*********************** For slash **************************/
-  function misdemeanor(address validator) external onlySlash initValidatorExtraSet override {
-    uint256 validatorIndex = _misdemeanor(validator);
-    if (canEnterMaintenance(validatorIndex)) {
-      _enterMaintenance(validator, validatorIndex);
-    }
-  }
-
-  function felony(address validator) external initValidatorExtraSet override {
-    require(msg.sender == SLASH_CONTRACT_ADDR || msg.sender == STAKE_HUB_ADDR, "only slash or stakeHub contract");
-
-    uint256 index = currentValidatorSetMap[validator];
-    if (index <= 0) {
-      return;
-    }
-    // the actual index
-    index = index - 1;
-
-    bool isMaintaining = validatorExtraSet[index].isMaintaining;
-    if (_felony(validator, index) && isMaintaining) {
-      --numOfMaintaining;
-    }
-  }
-
-  function removeTmpMigratedValidator(address validator) external onlyStakeHub {
-    for (uint256 i; i < _tmpMigratedValidatorSet.length; ++i) {
-      if (_tmpMigratedValidatorSet[i].consensusAddress == validator) {
-        _tmpMigratedValidatorSet[i].jailed = true;
-        break;
-      }
-    }
-  }
-
-  /*********************** For Temporary Maintenance **************************/
-  /**
-   * @notice Return the index of the validator in `currentValidatorSet`(from 0 to `currentValidatorSet.length-1`)
-   */
-  function getCurrentValidatorIndex(address validator) public view returns (uint256) {
-    uint256 index = currentValidatorSetMap[validator];
-    require(index > 0, "only current validators");
-
-    // the actual index
-    return index - 1;
-  }
-
-  /**
-   * @notice Return whether the validator at index could enter maintenance
-   */
-  function canEnterMaintenance(uint256 index) public view returns (bool) {
-    if (index >= currentValidatorSet.length) {
-      return false;
-    }
-
-    if (
-      currentValidatorSet[index].consensusAddress == address(0)     // - 0. check if empty validator
-      || (maxNumOfMaintaining == 0 || maintainSlashScale == 0)      // - 1. check if not start
-      || numOfMaintaining >= maxNumOfMaintaining                    // - 2. check if reached upper limit
-      || !isWorkingValidator(index)                                 // - 3. check if not working(not jailed and not maintaining)
-      || validatorExtraSet[index].enterMaintenanceHeight > 0        // - 5. check if has Maintained during current 24-hour period
-                                                                    // current validators are selected every 24 hours(from 00:00:00 UTC to 23:59:59 UTC)
-      || getValidators().length <= 1                                // - 6. check num of remaining working validators
-    ) {
-      return false;
-    }
-
-    return true;
-  }
-
-  /**
-   * @dev Enter maintenance for current validators. refer to https://github.com/bnb-chain/BEPs/blob/master/BEP127.md
-   */
-  function enterMaintenance() external initValidatorExtraSet {
-    // check maintain config
-    if (maxNumOfMaintaining == 0) {
-      maxNumOfMaintaining = INIT_MAX_NUM_OF_MAINTAINING;
-    }
-    if (maintainSlashScale == 0) {
-      maintainSlashScale = INIT_MAINTAIN_SLASH_SCALE;
-    }
-
-    uint256 index = getCurrentValidatorIndex(msg.sender);
-    require(canEnterMaintenance(index), "can not enter Temporary Maintenance");
-    _enterMaintenance(msg.sender, index);
-  }
-
-  /**
-   * @dev Exit maintenance for current validators. refer to https://github.com/bnb-chain/BEPs/blob/master/BEP127.md
-   */
-  function exitMaintenance() external {
-    uint256 index = getCurrentValidatorIndex(msg.sender);
-
-    // jailed validators are allowed to exit maintenance
-    require(validatorExtraSet[index].isMaintaining, "not in maintenance");
-    uint256 workingValidatorCount = getWorkingValidatorCount();
-    _exitMaintenance(msg.sender, index, workingValidatorCount);
-  }
-
-  /*********************** Param update ********************************/
-  function updateParam(string calldata key, bytes calldata value) override external onlyInit onlyGov{
-    if (Memory.compareStrings(key, "expireTimeSecondGap")) {
-      require(value.length == 32, "length of expireTimeSecondGap mismatch");
-      uint256 newExpireTimeSecondGap = BytesToTypes.bytesToUint256(32, value);
-      require(newExpireTimeSecondGap >=100 && newExpireTimeSecondGap <= 1e5, "the expireTimeSecondGap is out of range");
-      expireTimeSecondGap = newExpireTimeSecondGap;
-    } else if (Memory.compareStrings(key, "burnRatio")) {
-      require(value.length == 32, "length of burnRatio mismatch");
-      uint256 newBurnRatio = BytesToTypes.bytesToUint256(32, value);
-      require(newBurnRatio.add(systemRewardRatio) <= BLOCK_FEES_RATIO_SCALE, "the burnRatio plus systemRewardRatio must be no greater than 10000");
-      burnRatio = newBurnRatio;
-    } else if (Memory.compareStrings(key, "maxNumOfMaintaining")) {
-      require(value.length == 32, "length of maxNumOfMaintaining mismatch");
-      uint256 newMaxNumOfMaintaining = BytesToTypes.bytesToUint256(32, value);
-      uint256 _numOfCabinets = numOfCabinets;
-      if (_numOfCabinets == 0) {
-        _numOfCabinets = INIT_NUM_OF_CABINETS;
-      }
-      require(newMaxNumOfMaintaining < _numOfCabinets, "the maxNumOfMaintaining must be less than numOfCabinets");
-      maxNumOfMaintaining = newMaxNumOfMaintaining;
-    } else if (Memory.compareStrings(key, "maintainSlashScale")) {
-      require(value.length == 32, "length of maintainSlashScale mismatch");
-      uint256 newMaintainSlashScale = BytesToTypes.bytesToUint256(32, value);
-      require(newMaintainSlashScale > 0 && newMaintainSlashScale < 10, "the maintainSlashScale must be greater than 0 and less than 10");
-      maintainSlashScale = newMaintainSlashScale;
-    } else if (Memory.compareStrings(key, "maxNumOfWorkingCandidates")) {
-      require(value.length == 32, "length of maxNumOfWorkingCandidates mismatch");
-      uint256 newMaxNumOfWorkingCandidates = BytesToTypes.bytesToUint256(32, value);
-      require(newMaxNumOfWorkingCandidates <= maxNumOfCandidates, "the maxNumOfWorkingCandidates must be not greater than maxNumOfCandidates");
-      maxNumOfWorkingCandidates = newMaxNumOfWorkingCandidates;
-    } else if (Memory.compareStrings(key, "maxNumOfCandidates")) {
-      require(value.length == 32, "length of maxNumOfCandidates mismatch");
-      uint256 newMaxNumOfCandidates = BytesToTypes.bytesToUint256(32, value);
-      maxNumOfCandidates = newMaxNumOfCandidates;
-      if (maxNumOfWorkingCandidates > maxNumOfCandidates) {
-        maxNumOfWorkingCandidates = maxNumOfCandidates;
-      }
-    } else if (Memory.compareStrings(key, "numOfCabinets")) {
-      require(value.length == 32, "length of numOfCabinets mismatch");
-      uint256 newNumOfCabinets = BytesToTypes.bytesToUint256(32, value);
-      require(newNumOfCabinets > 0, "the numOfCabinets must be greater than 0");
-      require(newNumOfCabinets <= MAX_NUM_OF_VALIDATORS, "the numOfCabinets must be less than MAX_NUM_OF_VALIDATORS");
-      numOfCabinets = newNumOfCabinets;
-    } else if (Memory.compareStrings(key, "systemRewardRatio")) {
-      require(value.length == 32, "length of systemRewardRatio mismatch");
-      uint256 newSystemRewardRatio = BytesToTypes.bytesToUint256(32, value);
-      require(newSystemRewardRatio.add(burnRatio) <= BLOCK_FEES_RATIO_SCALE, "the systemRewardRatio plus burnRatio must be no greater than 10000");
-      systemRewardRatio = newSystemRewardRatio;
-    } else {
-      require(false, "unknown param");
-    }
-    emit paramChange(key, value);
-  }
-
-  /*********************** Internal Functions **************************/
   function doUpdateState(Validator[] memory newValidatorSet, bytes[] memory newVoteAddrs) private {
     uint n = currentValidatorSet.length;
     uint m = newValidatorSet.length;
@@ -960,6 +944,23 @@ contract BSCValidatorSet is IBSCValidatorSet, System, IParamSubscriber, IApplica
     for (uint i; i<n; ++i) {
       validatorExtraSet[i].isMaintaining = false;
       validatorExtraSet[i].enterMaintenanceHeight = 0;
+    }
+  }
+
+  /**
+   * @dev With each epoch, there will be a partial rotation between cabinets and candidates. Rotation is determined by this function
+   */
+  function shuffle(address[] memory validators, bytes[] memory voteAddrs, uint256 epochNumber, uint startIdx, uint offset, uint limit, uint modNumber) internal pure {
+    for (uint i; i<limit; ++i) {
+      uint random = uint(keccak256(abi.encodePacked(epochNumber, startIdx+i))) % modNumber;
+      if ( (startIdx+i) != (offset+random) ) {
+        address tmpAddr = validators[startIdx+i];
+        bytes memory tmpBLS = voteAddrs[startIdx+i];
+        validators[startIdx+i] = validators[offset+random];
+        validators[offset+random] = tmpAddr;
+        voteAddrs[startIdx+i] = voteAddrs[offset+random];
+        voteAddrs[offset+random] = tmpBLS;
+      }
     }
   }
 
